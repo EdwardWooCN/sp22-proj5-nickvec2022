@@ -682,8 +682,8 @@ public class ARIESRecoveryManager implements RecoveryManager {
      *   the pageLSN is checked, and the record is redone if needed.
      */
     void restartRedo() {
-        if (!logManager.iterator().hasNext()) {
-            return; // we can't redo anything if the log is empty!
+        if (!logManager.iterator().hasNext() || dirtyPageTable.size() == 0) {
+            return; // we can't redo anything if the log/DPT is empty
         }
         long lowestRecLSN = Long.MAX_VALUE;
         for (long recLSN : dirtyPageTable.values()) {

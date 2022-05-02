@@ -567,6 +567,92 @@ public class TestRecoveryManager {
             assertEquals(l*l, (long) p.getSecond());
         }
     }
+    /**
+     * Tests that end checkpoints are appended when as full as possible, multiple times over (huge!):
+     *  - DPT is filled with 200 entries, and the transaction table is filled
+     *    with 300 entries. Afterwards, a checkpoint is created.
+     *    Checks:
+     *      - First end checkpoint contains all of the DPT entries and as many
+     *        possible transaction table entries that can fit in the remaining
+     *        space (in this case, 52)
+     *      - Second end checkpoint contains all transaction table
+     *        entries (in this case, 240.)
+     *      - Third end checkpoint contains all remaing transaction tables entries. (8)
+     */
+    @Test
+    @Category(PublicTests.class)
+    public void testSpecExampleCheckpoint() {
+        // Create 200 DPT entries and 300 transaction table entries
+        for (long l = 1; l <= 200; l++) {
+            dirtyPageTable.put(l, l*l);
+        }
+        for (long l = 1; l <= 300; l++) {
+            Transaction t = DummyTransaction.create(l);
+            recoveryManager.startTransaction(t);
+            // Sets status to one of RUNNING, COMMITTING or ABORTING
+            t.setStatus(Transaction.Status.fromInt((int) l % 3));
+            TransactionTableEntry entry = new TransactionTableEntry(t);
+            entry.lastLSN = l*l;
+            transactionTable.put(l, entry);
+        }
+
+        // Perform checkpoint
+        recoveryManager.checkpoint();
+
+        Iterator<LogRecord> logs = logManager.scanFrom(10000L);
+
+        // Next 4 logs should be from the checkpoint
+        LogRecord beginCheckpoint = logs.next();
+        LogRecord endCheckpoint1 = logs.next();
+        LogRecord endCheckpoint2 = logs.next();
+        LogRecord endCheckpoint3 = logs.next();
+        assertEquals(LogType.BEGIN_CHECKPOINT, beginCheckpoint.getType());
+        assertEquals(LogType.END_CHECKPOINT, endCheckpoint1.getType());
+        assertEquals(LogType.END_CHECKPOINT, endCheckpoint2.getType());
+        assertEquals(LogType.END_CHECKPOINT, endCheckpoint3.getType());
+        assertFalse(logs.hasNext());
+
+        // Sanity check: If we have 200 DPT entries and 52 transaction table
+        // entries, there is no extra space for more transaction table entries.
+        assertTrue(EndCheckpointLogRecord.fitsInOneRecord(200, 52));
+        assertFalse(EndCheckpointLogRecord.fitsInOneRecord(200, 53));
+
+        // First end checkpoint should have all the DPT entries, and 52
+        // transaction table entries
+        assertEquals(200, endCheckpoint1.getDirtyPageTable().size());
+        assertEquals(52, endCheckpoint1.getTransactionTable().size());
+
+        // Second end checkpoint should have no DPT entries, and 240 xact entries.
+        assertEquals(0, endCheckpoint2.getDirtyPageTable().size());
+        assertEquals(240, endCheckpoint2.getTransactionTable().size());
+
+        // Third end checkpoint should have 8 xact entries.
+        assertEquals(0, endCheckpoint3.getDirtyPageTable().size());
+        assertEquals(8, endCheckpoint3.getTransactionTable().size());
+
+        // Check the contents of the checkpoint DPT/transaction tables match
+        // what we inserted earlier
+        for (long l = 1; l <= 200; l++) {
+            assertEquals(l*l, (long) endCheckpoint1.getDirtyPageTable().get(l));
+        }
+        for (long l = 1; l <= 300; l++) {
+            Pair<Transaction.Status, Long> p;
+            if (endCheckpoint1.getTransactionTable().containsKey(l)) {
+                p = endCheckpoint1.getTransactionTable().get(l);
+            } else if (endCheckpoint2.getTransactionTable().containsKey(l)) {
+                p = endCheckpoint2.getTransactionTable().get(l);
+            } else if (endCheckpoint3.getTransactionTable().containsKey(l)) {
+                p = endCheckpoint3.getTransactionTable().get(l);
+            } else {
+                fail("Transaction #" + l + " could not be found in checkpoint ttables");
+                return;
+            }
+            // Status
+            assertEquals(p.getFirst(), Transaction.Status.fromInt((int) l % 3));
+            // prevLSN
+            assertEquals(l*l, (long) p.getSecond());
+        }
+    }
 
     /**
      * Test rolling back T2 while T1 is also running:
