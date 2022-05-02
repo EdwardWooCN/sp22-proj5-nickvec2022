@@ -14,7 +14,7 @@ import java.util.function.Consumer;
 /**
  * An record of the log.
  */
-public abstract class LogRecord {
+public abstract class  LogRecord {
     // LSN of this record, or null if not set - this is not actually
     // stored on disk, and is only set by the log manager for convenience
     protected Long LSN;

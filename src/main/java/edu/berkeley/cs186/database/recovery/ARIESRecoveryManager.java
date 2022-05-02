@@ -1,6 +1,7 @@
 package edu.berkeley.cs186.database.recovery;
 
 import edu.berkeley.cs186.database.Transaction;
+import edu.berkeley.cs186.database.TransactionContext;
 import edu.berkeley.cs186.database.common.Pair;
 import edu.berkeley.cs186.database.concurrency.DummyLockContext;
 import edu.berkeley.cs186.database.io.DiskSpaceManager;
@@ -92,8 +93,13 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     @Override
     public long commit(long transNum) {
-        // TODO(proj5): implement
-        return -1L;
+        TransactionTableEntry entry = transactionTable.get(transNum);
+        LogRecord record = new CommitTransactionLogRecord(transNum, entry.lastLSN);
+        logManager.appendToLog(record);
+        logManager.flushToLSN(record.LSN);
+        entry.lastLSN = record.getLSN();
+        entry.transaction.setStatus(Transaction.Status.COMMITTING);
+        return record.getLSN();
     }
 
     /**
@@ -108,8 +114,12 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     @Override
     public long abort(long transNum) {
-        // TODO(proj5): implement
-        return -1L;
+        TransactionTableEntry entry = transactionTable.get(transNum);
+        LogRecord record = new AbortTransactionLogRecord(transNum, entry.lastLSN);
+        logManager.appendToLog(record);
+        entry.lastLSN = record.getLSN();
+        entry.transaction.setStatus(Transaction.Status.ABORTING);
+        return record.getLSN();
     }
 
     /**
@@ -126,8 +136,15 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     @Override
     public long end(long transNum) {
-        // TODO(proj5): implement
-        return -1L;
+        TransactionTableEntry entry = transactionTable.get(transNum);
+        if (entry.transaction.getStatus() == Transaction.Status.ABORTING) {
+            rollbackToLSN(transNum, 0);
+        }
+        transactionTable.remove(transNum);
+        LogRecord endRecord = new EndTransactionLogRecord(transNum, entry.lastLSN);
+        logManager.appendToLog(endRecord);
+        entry.transaction.setStatus(Transaction.Status.COMPLETE);
+        return endRecord.getLSN();
     }
 
     /**
@@ -154,7 +171,16 @@ public class ARIESRecoveryManager implements RecoveryManager {
         // Small optimization: if the last record is a CLR we can start rolling
         // back from the next record that hasn't yet been undone.
         long currentLSN = lastRecord.getUndoNextLSN().orElse(lastRecordLSN);
-        // TODO(proj5) implement the rollback logic described above
+        while (currentLSN > LSN) {
+            LogRecord currRecord = logManager.fetchLogRecord(currentLSN);
+            if (currRecord.isUndoable()) {
+                LogRecord clr = currRecord.undo(transactionEntry.lastLSN);
+                logManager.appendToLog(clr);
+                transactionEntry.lastLSN = clr.getLSN();
+                clr.redo(this, diskSpaceManager, bufferManager);
+            }
+            currentLSN = currRecord.getPrevLSN().get();
+        }
     }
 
     /**
@@ -204,8 +230,14 @@ public class ARIESRecoveryManager implements RecoveryManager {
                              byte[] after) {
         assert (before.length == after.length);
         assert (before.length <= BufferManager.EFFECTIVE_PAGE_SIZE / 2);
-        // TODO(proj5): implement
-        return -1L;
+        TransactionTableEntry entry = transactionTable.get(transNum);
+        LogRecord record = new UpdatePageLogRecord(transNum, pageNum, entry.lastLSN, pageOffset, before, after);
+        logManager.appendToLog(record);
+        entry.lastLSN = record.getLSN();
+        if (!dirtyPageTable.containsKey(pageNum)) {
+            dirtyPageTable.put(pageNum, record.getLSN());
+        }
+        return record.getLSN();
     }
 
     /**
@@ -379,9 +411,7 @@ public class ARIESRecoveryManager implements RecoveryManager {
 
         // All of the transaction's changes strictly after the record at LSN should be undone.
         long savepointLSN = transactionEntry.getSavepoint(name);
-
-        // TODO(proj5): implement
-        return;
+        rollbackToLSN(transNum, savepointLSN);
     }
 
     /**
@@ -406,9 +436,32 @@ public class ARIESRecoveryManager implements RecoveryManager {
 
         Map<Long, Long> chkptDPT = new HashMap<>();
         Map<Long, Pair<Transaction.Status, Long>> chkptTxnTable = new HashMap<>();
-
-        // TODO(proj5): generate end checkpoint record(s) for DPT and transaction table
-
+        for (Long dptKey : dirtyPageTable.keySet()) {
+            chkptDPT.put(dptKey, dirtyPageTable.get(dptKey));
+            // if it doesn't fit after adding dptKey, we should remove and create/add endCheckPoint
+            if (!EndCheckpointLogRecord.fitsInOneRecord(chkptDPT.keySet().size(), 0)) {
+                chkptDPT.remove(dptKey);
+                LogRecord splitLog = new EndCheckpointLogRecord(chkptDPT, chkptTxnTable);
+                logManager.appendToLog(splitLog);
+                // must "clear" chkptDPT as well since we don't want to include in next log.
+                chkptDPT.clear();
+                chkptDPT.put(dptKey, dirtyPageTable.get(dptKey));
+            }
+        }
+        for (Long txnKey : transactionTable.keySet()) {
+            TransactionTableEntry entry = transactionTable.get(txnKey);
+            chkptTxnTable.put(txnKey, new Pair<>(entry.transaction.getStatus(), entry.lastLSN));
+            // if it doesn't fit after adding txnKey, we should remove and create/add endCheckpoint.
+            if (!EndCheckpointLogRecord.fitsInOneRecord(chkptDPT.keySet().size(), chkptTxnTable.keySet().size())) {
+                chkptTxnTable.remove(txnKey);
+                LogRecord splitLog = new EndCheckpointLogRecord(chkptDPT, chkptTxnTable);
+                logManager.appendToLog(splitLog);
+                // must clear both chkptDPT and chkptTxnTable.
+                chkptDPT.clear();
+                chkptTxnTable.clear();
+                chkptTxnTable.put(txnKey, new Pair<>(entry.transaction.getStatus(), entry.lastLSN));
+            }
+        }
         // Last end checkpoint record
         LogRecord endRecord = new EndCheckpointLogRecord(chkptDPT, chkptTxnTable);
         logManager.appendToLog(endRecord);
@@ -519,8 +572,101 @@ public class ARIESRecoveryManager implements RecoveryManager {
         long LSN = masterRecord.lastCheckpointLSN;
         // Set of transactions that have completed
         Set<Long> endedTransactions = new HashSet<>();
-        // TODO(proj5): implement
-        return;
+        Iterator<LogRecord> logIterator = logManager.scanFrom(LSN);
+        while (logIterator.hasNext()) {
+            record = logIterator.next();
+            LogType type = record.getType();
+            if (record.getTransNum().isPresent()) {
+                long transNum = record.getTransNum().get();
+                if (!transactionTable.containsKey(transNum)) {
+                    Transaction trans = newTransaction.apply(transNum);
+                    startTransaction(trans);
+                }
+                TransactionTableEntry entry = transactionTable.get(transNum);
+                entry.lastLSN = record.getLSN();
+            }
+            if (record.getPageNum().isPresent()) {
+                long pageNum = record.getPageNum().get();
+                if (type == LogType.UPDATE_PAGE || type == LogType.UNDO_UPDATE_PAGE) {
+                    dirtyPage(pageNum, record.getLSN());
+                }
+                if (type == LogType.FREE_PAGE || type == LogType.UNDO_ALLOC_PAGE) {
+                    dirtyPageTable.remove(pageNum);
+                }
+            }
+            if (type == LogType.COMMIT_TRANSACTION || type == LogType.ABORT_TRANSACTION || type == LogType.END_TRANSACTION) {
+                long transNum = record.getTransNum().get();
+                if (!transactionTable.containsKey(transNum)) {
+                    Transaction trans = newTransaction.apply(transNum);
+                    startTransaction(trans);
+                }
+            }
+            if (type == LogType.COMMIT_TRANSACTION) {
+                long transNum = record.getTransNum().get();
+                TransactionTableEntry entry = transactionTable.get(transNum);
+                entry.transaction.setStatus(Transaction.Status.COMMITTING);
+            }
+            if (type == LogType.ABORT_TRANSACTION) {
+                long transNum = record.getTransNum().get();
+                TransactionTableEntry entry = transactionTable.get(transNum);
+                entry.transaction.setStatus(Transaction.Status.RECOVERY_ABORTING);
+            }
+            if (type == LogType.END_TRANSACTION) {
+                long transNum = record.getTransNum().get();
+                TransactionTableEntry entry = transactionTable.get(transNum);
+                entry.transaction.cleanup();
+                entry.transaction.setStatus(Transaction.Status.COMPLETE);
+                transactionTable.remove(transNum);
+                endedTransactions.add(transNum);
+            }
+            if (type == LogType.END_CHECKPOINT) {
+                Map<Long, Long> dpt = record.getDirtyPageTable();
+                Map<Long, Pair<Transaction.Status, Long>> tt = record.getTransactionTable();
+                for (Long pageNum : dpt.keySet()) {
+                    dirtyPageTable.put(pageNum, dpt.get(pageNum));
+                }
+                for (Long tNum : tt.keySet()) {
+                    if (endedTransactions.contains(tNum)) {
+                        continue;
+                    }
+                    if (!transactionTable.containsKey(tNum)) {
+                        Transaction newTrans = newTransaction.apply(tNum);
+                        startTransaction(newTrans);
+                    }
+                    long lastLSN = tt.get(tNum).getSecond();
+                    Transaction.Status chkptStatus = tt.get(tNum).getFirst();
+                    Transaction.Status currStatus = transactionTable.get(tNum).transaction.getStatus();
+                    TransactionTableEntry tEntry = transactionTable.get(tNum);
+                    if (lastLSN >= tEntry.lastLSN) {
+                        tEntry.lastLSN = lastLSN;
+                    }
+                    if (chkptStatus == Transaction.Status.ABORTING && currStatus == Transaction.Status.RUNNING) {
+                        tEntry.transaction.setStatus(Transaction.Status.RECOVERY_ABORTING);
+                    } else if (chkptStatus == Transaction.Status.COMPLETE) {
+                        tEntry.transaction.setStatus(Transaction.Status.COMPLETE);
+                    } else if (tEntry.transaction.getStatus() == Transaction.Status.RUNNING) {
+                        tEntry.transaction.setStatus(chkptStatus);
+                    }
+                }
+            }
+        }
+        for (Long tNum : transactionTable.keySet()) {
+            TransactionTableEntry entry = transactionTable.get(tNum);
+            if (entry.transaction.getStatus() == Transaction.Status.COMMITTING) {
+                entry.transaction.cleanup();
+                entry.transaction.setStatus(Transaction.Status.COMPLETE);
+                transactionTable.remove(tNum);
+                LogRecord endRecord = new EndTransactionLogRecord(tNum, entry.lastLSN);
+                logManager.appendToLog(endRecord);
+                entry.lastLSN = endRecord.getLSN();
+            }
+            if (entry.transaction.getStatus() == Transaction.Status.RUNNING) {
+                entry.transaction.setStatus(Transaction.Status.RECOVERY_ABORTING);
+                LogRecord endRecord = new AbortTransactionLogRecord(tNum, entry.lastLSN);
+                logManager.appendToLog(endRecord);
+                entry.lastLSN = endRecord.getLSN();
+            }
+        }
     }
 
     /**
@@ -536,8 +682,40 @@ public class ARIESRecoveryManager implements RecoveryManager {
      *   the pageLSN is checked, and the record is redone if needed.
      */
     void restartRedo() {
-        // TODO(proj5): implement
-        return;
+        if (!logManager.iterator().hasNext()) {
+            return; // we can't redo anything if the log is empty!
+        }
+        long lowestRecLSN = Long.MAX_VALUE;
+        for (long recLSN : dirtyPageTable.values()) {
+            lowestRecLSN = Math.min(recLSN, lowestRecLSN);
+        }
+        Iterator<LogRecord> logRecordIterator = logManager.scanFrom(lowestRecLSN);
+        while (logRecordIterator.hasNext()) {
+            LogRecord record = logRecordIterator.next();
+            if (record.isRedoable()) {
+                LogType type = record.getType();
+                if (type == LogType.ALLOC_PART || type == LogType.UNDO_ALLOC_PART
+                        || type == LogType.FREE_PART || type == LogType.UNDO_FREE_PART
+                        || type == LogType.ALLOC_PAGE || type == LogType.UNDO_FREE_PAGE) {
+                    record.redo(this, diskSpaceManager, bufferManager);
+                }
+                if (type == LogType.UPDATE_PAGE || type == LogType.UNDO_UPDATE_PAGE
+                        || type == LogType.UNDO_ALLOC_PAGE || type == LogType.FREE_PAGE) {
+                    long pageNum = record.getPageNum().get();
+                    long pageLSN;
+                    Page page = bufferManager.fetchPage(new DummyLockContext(), pageNum);
+                    try {
+                        pageLSN = page.getPageLSN();
+                    } finally {
+                        page.unpin();
+                    }
+                    if (dirtyPageTable.containsKey(pageNum)
+                            && record.getLSN() >= dirtyPageTable.get(pageNum) && pageLSN < record.getLSN()) {
+                        record.redo(this, diskSpaceManager, bufferManager);
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -554,8 +732,43 @@ public class ARIESRecoveryManager implements RecoveryManager {
      *   and remove from transaction table.
      */
     void restartUndo() {
-        // TODO(proj5): implement
-        return;
+        PriorityQueue<Pair<Long, TransactionTableEntry>> pq = new PriorityQueue<>(new PairFirstReverseComparator());
+        for (Long transNum : transactionTable.keySet()) {
+            TransactionTableEntry entry = transactionTable.get(transNum);
+            if (entry.transaction.getStatus() == Transaction.Status.RECOVERY_ABORTING) {
+                pq.add(new Pair<>(entry.lastLSN, entry));
+            }
+        }
+        while (pq.size() > 0) {
+            Pair<Long, TransactionTableEntry> next = pq.poll();
+            Long lastLSN = next.getFirst();
+            TransactionTableEntry entry = next.getSecond();
+            LogRecord record = logManager.fetchLogRecord(lastLSN);
+            if (record.isUndoable()) {
+                LogRecord clr = record.undo(entry.lastLSN);
+                logManager.appendToLog(clr);
+                entry.lastLSN = clr.getLSN();
+                clr.redo(this, diskSpaceManager, bufferManager);
+            }
+            Long prevLSN = -1L;
+            if (record.getUndoNextLSN().isPresent()) {
+                pq.remove(next);
+                prevLSN = record.getUndoNextLSN().get();
+                pq.add(new Pair<>(prevLSN, entry));
+            } else if (record.getPrevLSN().isPresent()) {
+                pq.remove(next);
+                prevLSN = record.getPrevLSN().get();
+                pq.add(new Pair<>(prevLSN, entry));
+            }
+            if (prevLSN == 0) {
+                long tNum = entry.transaction.getTransNum();
+                pq.remove(next);
+                transactionTable.remove(tNum);
+                LogRecord endRecord = new EndTransactionLogRecord(tNum, entry.lastLSN);
+                logManager.appendToLog(endRecord);
+                entry.transaction.setStatus(Transaction.Status.COMPLETE);
+            }
+        }
     }
 
     /**
